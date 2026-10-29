@@ -17,7 +17,7 @@ export interface ParseResult {
   rawModelText?: string | undefined; // for debugging (only when DEBUG_PARSE=1)
   model?: string | undefined; // which model was used
   durationMs?: number | undefined;
-  source: "gemini" | "mock";
+  source: "gemini" | "openai" | "mock";
   usedModelVersion?: string | undefined;
   modelsTried?:
     | Array<{
@@ -67,6 +67,13 @@ const MODEL_CANDIDATES = Array.from(
     "gemini-1.5-flash",
   ])
 );
+
+// Optional alternative provider: used only when GEMINI_API_KEY is not set
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL_PARSE = process.env.OPENAI_MODEL_PARSE || "gpt-4o-mini";
+const OPENAI_BASE_URL = (
+  process.env.OPENAI_BASE_URL || "https://api.openai.com/v1"
+).replace(/\/+$/, "");
 
 const DEBUG_PARSE = process.env.DEBUG_PARSE === "1";
 let cachedModel: { model: string; version: string } | null = null;
@@ -259,6 +266,7 @@ export async function parseReceipt(
   options: ParseOptions
 ): Promise<ParseResult> {
   if (!GEMINI_API_KEY) {
+    if (OPENAI_API_KEY) return parseViaOpenAI(options);
     if (DEBUG_PARSE)
       console.warn("[parseReceipt] Using mock: GEMINI_API_KEY not set");
     return mockParse();
@@ -471,4 +479,65 @@ async function generateViaRest(
     }
   }
   throw lastErr || new Error("All versions failed");
+}
+
+/** Receipt parsing through the OpenAI Chat Completions API (vision input) */
+async function parseViaOpenAI(options: ParseOptions): Promise<ParseResult> {
+  const start = Date.now();
+  const prompt = `${EXTRACTION_INSTRUCTIONS}\nLanguage context of receipt: ${options.language}\nSession Name: ${options.sessionName}`;
+  try {
+    const resp = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL_PARSE,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: `${prompt}\nOUTPUT ONLY RAW JSON. NO MARKDOWN.` },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:${options.mimeType};base64,${options.imageBase64}`,
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw Object.assign(new Error(`HTTP ${resp.status} ${txt.slice(0, 300)}`), {
+        status: resp.status,
+      });
+    }
+    const json: any = await resp.json();
+    const text: string = json?.choices?.[0]?.message?.content ?? "";
+    const parsed = safeParseJson(text);
+    if (!parsed.ok || !parsed.data) {
+      throw new Error(`OpenAI returned non-parseable JSON (${text.length} chars)`);
+    }
+    const durationMs = Date.now() - start;
+    if (DEBUG_PARSE)
+      console.log(
+        `[parseViaOpenAI] success model=${OPENAI_MODEL_PARSE} items=${parsed.data.items.length} ${durationMs}ms`
+      );
+    return {
+      ...parsed.data,
+      source: "openai",
+      model: OPENAI_MODEL_PARSE,
+      durationMs,
+      rawModelText: DEBUG_PARSE ? text.slice(0, 4000) : undefined,
+    };
+  } catch (err: any) {
+    console.error("[parseViaOpenAI] failed, returning mock:", err?.message || err);
+    return mockParse();
+  }
 }

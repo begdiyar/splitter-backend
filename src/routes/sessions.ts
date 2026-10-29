@@ -642,6 +642,20 @@ router.post(
         new Set(byParticipant.map((p) => p.uniqueId))
       ).sort();
 
+      // The creator paid the bill, so their own share is settled from the start.
+      // On re-finalize keep earlier payment marks for participants who are still present.
+      const creator = await prisma.user.findUnique({
+        where: { id: session.creatorId },
+        select: { uniqueId: true },
+      });
+      const existingEntry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId: session.id },
+        select: { paidUniqueIds: true },
+      });
+      const paidSet = new Set(existingEntry?.paidUniqueIds ?? []);
+      if (creator?.uniqueId) paidSet.add(creator.uniqueId);
+      const paidUniqueIds = participantUniqueIds.filter((id) => paidSet.has(id));
+
       await prisma.sessionHistoryEntry.upsert({
         where: { sessionId: session.id },
         create: {
@@ -650,6 +664,7 @@ router.post(
           sessionName: sessionName ?? null,
           payload: responsePayload as Prisma.JsonObject,
           participantUniqueIds,
+          paidUniqueIds,
           grandTotal: grandTotal.toString(),
           currency,
           finalizedAt,
@@ -658,13 +673,14 @@ router.post(
           sessionName: sessionName ?? null,
           payload: responsePayload as Prisma.JsonObject,
           participantUniqueIds,
+          paidUniqueIds,
           grandTotal: grandTotal.toString(),
           currency,
           finalizedAt,
         },
       });
 
-      return res.json(responsePayload);
+      return res.json({ ...responsePayload, paidUniqueIds });
     } catch (err) {
       console.error("POST /sessions/finalize error:", err);
       return res.status(500).json({ error: "Server error" });
@@ -740,6 +756,7 @@ router.get(
         where: whereFilter,
         orderBy: { finalizedAt: "desc" },
         ...(fetchAll ? {} : { take: limit }),
+        include: { creator: { select: { uniqueId: true } } },
       });
 
       const response = entries.map((entry) => ({
@@ -749,6 +766,8 @@ router.get(
         grandTotal: entry.grandTotal.toNumber(),
         currency: entry.currency,
         participantUniqueIds: entry.participantUniqueIds,
+        paidUniqueIds: entry.paidUniqueIds,
+        creatorUniqueId: entry.creator.uniqueId,
         isCreator: entry.creatorId === requesterId,
         payload: entry.payload,
       }));
@@ -761,6 +780,114 @@ router.get(
       });
     } catch (err) {
       console.error("GET /sessions/history error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /sessions/{sessionId}/payments:
+ *   patch:
+ *     summary: Mark a participant's share of a finalized session as paid / unpaid
+ *     description: Only the session creator (the person who paid the bill) can change payment status.
+ *     tags: [Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [uniqueId, paid]
+ *             properties:
+ *               uniqueId:
+ *                 type: string
+ *                 example: "USER#1234"
+ *               paid:
+ *                 type: boolean
+ *                 example: true
+ *     responses:
+ *       200:
+ *         description: Updated payment status
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 sessionId: { type: integer }
+ *                 paidUniqueIds:
+ *                   type: array
+ *                   items: { type: string }
+ *       400:
+ *         description: Invalid input or participant not in session
+ *       403:
+ *         description: Only the session creator can update payments
+ *       404:
+ *         description: Finalized session not found
+ */
+router.patch(
+  "/:sessionId/payments",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isInteger(sessionId) || sessionId <= 0) {
+        return res.status(400).json({ error: "Invalid sessionId" });
+      }
+      const { uniqueId, paid } = req.body || {};
+      if (typeof uniqueId !== "string" || !uniqueId.trim()) {
+        return res.status(400).json({ error: "uniqueId required" });
+      }
+      if (typeof paid !== "boolean") {
+        return res.status(400).json({ error: "paid must be a boolean" });
+      }
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: {
+          creatorId: true,
+          participantUniqueIds: true,
+          paidUniqueIds: true,
+        },
+      });
+      if (!entry) {
+        return res.status(404).json({ error: "Finalized session not found" });
+      }
+      if (entry.creatorId !== req.user.id) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      const target = uniqueId.trim();
+      if (!entry.participantUniqueIds.includes(target)) {
+        return res
+          .status(400)
+          .json({ error: "Participant is not part of this session" });
+      }
+
+      const paidSet = new Set(entry.paidUniqueIds);
+      if (paid) paidSet.add(target);
+      else paidSet.delete(target);
+      // keep the same order as participants for stable responses
+      const paidUniqueIds = entry.participantUniqueIds.filter((id) =>
+        paidSet.has(id)
+      );
+
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { paidUniqueIds },
+      });
+
+      return res.json({ sessionId, paidUniqueIds });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/payments error:", err);
       return res.status(500).json({ error: "Server error" });
     }
   }

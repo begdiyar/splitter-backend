@@ -47,6 +47,9 @@ Receipt parsing (Gemini) optional:
 - `GEMINI_API_KEY` — enables real receipt parsing (without it, server returns deterministic mock items)
 - `GEMINI_MODEL_PARSE` — model name (default `gemini-1.5-flash`)
 - `DEBUG_PARSE=1` — include raw model text & timing in response under `_debug`
+- `OPENAI_API_KEY` — alternative provider, used only when `GEMINI_API_KEY` is empty
+- `OPENAI_MODEL_PARSE` — OpenAI vision model (default `gpt-4o-mini`)
+- `OPENAI_BASE_URL` — override API base URL (default `https://api.openai.com/v1`)
 
 Body size tuning:
 
@@ -87,6 +90,8 @@ Swagger UI: `GET /api-docs`
 Health check: `GET /health` → `{ "status": "ok" }`
 
 Auth routes mounted at `/auth` (`/auth/register`, `/auth/login`, `/auth/me`).
+
+Payment tracking: after `/sessions/finalize`, the session creator (who paid the bill) can mark each participant's share as paid with `PATCH /sessions/{sessionId}/payments` (`{ "uniqueId": "#1234", "paid": true }`). `GET /sessions/history` returns `paidUniqueIds` and `creatorUniqueId` for every entry.
 
 ### Docker
 
